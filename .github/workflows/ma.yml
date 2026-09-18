@@ -1,0 +1,107 @@
+name: Debian Linux Auto-Login Desktop Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-desktop:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Desktop Environment & noVNC
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            lxde lxde-common x11vnc xvfb novnc websockify zenity net-tools
+
+      - name: Setup User and Auto-Login Session
+        run: |
+          USERNAME="MXDEV"
+          PASSWORD="MXDEV123"
+          
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+              sudo useradd -m -s /bin/bash "$USERNAME"
+              echo "$USERNAME:$PASSWORD" | sudo chpasswd
+              sudo usermod -aG sudo "$USERNAME"
+          fi
+          
+          USER_HOME="/home/$USERNAME"
+
+          # Автозапуск приветственного окна MX DEV
+          sudo mkdir -p "$USER_HOME/.config/autostart"
+          cat << 'EOF' | sudo tee "$USER_HOME/.config/autostart/mxdev-welcome.desktop" > /dev/null
+          [Desktop Entry]
+          Type=Application
+          Name=MX DEV Welcome
+          Exec=bash -c "sleep 3 && zenity --info --title='Welcome from MX DEV' --text='Welcome! This session is provided by MX DEV.\n\nSubscribe to our Telegram channel for more methods and updates:\nhttps://t.me/mxdevrdp' --width=400"
+          Hidden=false
+          NoDisplay=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          sudo chown -R "$USERNAME:$USERNAME" "$USER_HOME"
+
+          # 1. Запуск виртуального дисплея :1
+          sudo -u "$USERNAME" Xvfb :1 -screen 0 1280x720x24 > /dev/null 2>&1 &
+          sleep 2
+
+          # 2. Запуск LXDE (без ошибок D-Bus / failsafe)
+          sudo -u "$USERNAME" DISPLAY=:1 dbus-launch startlxde > /dev/null 2>&1 &
+          sleep 3
+
+          # 3. Запуск VNC без пароля на порту 5900
+          sudo -u "$USERNAME" DISPLAY=:1 x11vnc -forever -shared -nopw -rfbport 5900 > /dev/null 2>&1 &
+          sleep 1
+
+          # 4. Запуск noVNC (для входа прямо из браузера без ввода пароля)
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > /dev/null 2>&1 &
+
+          echo "RDP_USER=$USERNAME" >> $GITHUB_ENV
+          echo "RDP_PASS=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES+1))
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Maintain Connection
+        run: |
+          echo -e "\n======================================================="
+          echo " This session is brought to you by MX DEV!"
+          echo " Subscribe to our Telegram channel for more methods:"
+          echo " https://t.me/mxdevrdp"
+          echo -e "=======================================================\n"
+          
+          echo -e "\n=== AUTO-LOGIN CONNECTION METHODS ==="
+          echo "Address:     $TAILSCALE_IP"
+          echo "-------------------------------------------------------"
+          echo "1. Через браузер (noVNC):  http://$TAILSCALE_IP:6080/vnc.html"
+          echo "2. Через VNC приложение:   $TAILSCALE_IP:5900"
+          echo "-------------------------------------------------------"
+          echo "Пароль ВВОДИТЬ НЕ НУЖНО — вход автоматический на стол MXDEV!"
+          echo "=======================================================\n"
+          
+          while true; do
+              echo "[$(date)] Auto-login Desktop Active - MX DEV (https://t.me/mxdevrdp)"
+              sleep 300
+          done
+
