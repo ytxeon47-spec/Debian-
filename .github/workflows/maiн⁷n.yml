@@ -1,0 +1,103 @@
+name: Debian Linux RDP Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Install Desktop Environment & XRDP
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies xrdp dbus-x11 zenity
+          
+          echo "startxfce4" > ~/.xsession
+          sudo systemctl enable xrdp
+          sudo systemctl start xrdp
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          PASSWORD="MXDEV123"
+          USERNAME="MXDEV"
+          
+          if ! id -u "$USERNAME" >/dev/null 2>&1; then
+              sudo useradd -m -s /bin/bash "$USERNAME"
+              echo "$USERNAME:$PASSWORD" | sudo chpasswd
+              sudo usermod -aG sudo "$USERNAME"
+          fi
+          
+          sudo usermod -aG ssl-cert "$USERNAME"
+          
+          USER_HOME="/home/$USERNAME"
+          sudo mkdir -p "$USER_HOME/.config/autostart"
+          
+          cat << 'EOF' | sudo tee "$USER_HOME/.config/autostart/mxdev-welcome.desktop" > /dev/null
+          [Desktop Entry]
+          Type=Application
+          Name=MX DEV Welcome
+          Exec=bash -c "sleep 3 && zenity --info --title='Welcome from MX DEV' --text='Welcome! This session is provided by MX DEV.\n\nSubscribe to our Telegram channel for more methods and updates:\nhttps://t.me/mxdevrdp' --width=400"
+          Hidden=false
+          NoDisplay=false
+          X-GNOME-Autostart-enabled=true
+          EOF
+
+          sudo chown -R "$USERNAME:$USERNAME" "$USER_HOME/.config"
+          echo "RDP_CREDS=$PASSWORD" >> $GITHUB_ENV
+          echo "RDP_USER=$USERNAME" >> $GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES+1))
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          if nc -z -v -w5 127.0.0.1 3389 2>/dev/null; then
+              echo "TCP connectivity to XRDP port 3389 successful!"
+          else
+              echo "XRDP server port 3389 is not responding locally."
+              exit 1
+          fi
+
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          echo -e "\n======================================================="
+          echo " This RDP session is brought to you by MX DEV!"
+          echo " Subscribe to our Telegram channel for more methods:"
+          echo " https://t.me/mxdevrdp"
+          echo -e "=======================================================\n"
+          
+          echo -e "\n=== RDP ACCESS ==="
+          echo "Address:  $TAILSCALE_IP"
+          echo "Username: $RDP_USER"
+          echo "Password: $RDP_CREDS"
+          echo -e "==================\n"
+          
+          while true; do
+              echo "[$(date)] RDP Active - Powered by MX DEV (https://t.me/mxdevrdp)"
+              sleep 300
+          done
+
