@@ -1,0 +1,110 @@
+name: Debian Desktop 3D Accelerated (Tailscale & noVNC)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-debian-3d-desktop:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install Debian Desktop, XFCE4, VNC & 3D Stack
+        run: |
+          echo "=== [STEP 1/4] Installing GUI, VNC & Mesa 3D Drivers ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 \
+            xfce4-goodies \
+            x11vnc \
+            xvfb \
+            mesa-utils \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            libosmesa6 \
+            virgl-server \
+            novnc \
+            websockify \
+            curl \
+            wget
+
+          echo "=== Configuring GPU / DRI Video Acceleration ==="
+          if [ -d /dev/dri ]; then
+            sudo chmod -R 666 /dev/dri
+          fi
+
+      - name: 2. Connect Tailscale (Auto Connect)
+        run: |
+          echo "=== [STEP 2/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="debian-3d-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 3. Configure User Accounts & VNC Password
+        run: |
+          echo "=== [STEP 3/4] Configuring Credentials & VNC ==="
+          mkdir -p ~/.vnc
+          
+          # Установка системного пароля для пользователя runner
+          echo "runner:rootroot" | sudo chpasswd
+          
+          # Установка VNC-пароля
+          x11vnc -storepw rootroot ~/.vnc/passwd
+
+      - name: 4. Launch Desktop with 3D Emulation & noVNC
+        run: |
+          echo "=== [STEP 4/4] Starting 3D Accelerated Desktop ==="
+          
+          # Запуск виртуального дисплея с поддержкой GLX и 3D-ускорения
+          export GALLIUM_DRIVER=llvmpipe
+          export MESA_GL_VERSION_OVERRIDE=3.3
+          
+          Xvfb :1 -screen 0 1280x720x24 +extension GLX +extension Render -noreset &
+          sleep 3
+          
+          # Запуск рабочего стола XFCE4 с эмуляцией видеокарты
+          DISPLAY=:1 startxfce4 &
+          sleep 3
+          
+          # Запуск x11vnc с прямым подтягиванием GLX/3D
+          sudo x11vnc -rfbauth /home/runner/.vnc/passwd -auth guess -shared -forever -rfbport 5900 -display :1 &
+          sleep 3
+
+          # Запуск noVNC моста
+          NOVNC_DIR=$(dpkg -L novnc 2>/dev/null | grep -E 'vnc.html|index.html' | head -n 1 | xargs dirname)
+          if [ -z "$NOVNC_DIR" ]; then NOVNC_DIR="/usr/share/novnc"; fi
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " DEBIAN 3D DESKTOP READY"
+          echo "=================================================="
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo " Raw VNC Port : $TAILSCALE_IP:5900"
+          echo "--------------------------------------------------"
+          echo " LOGIN CREDENTIALS:"
+          echo " Username     : runner (или root)"
+          echo " Password     : rootroot"
+          echo " VNC Password : rootroot"
+          echo "=================================================="
+
+          # Удерживаем раннер активным
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "Runner Online | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
