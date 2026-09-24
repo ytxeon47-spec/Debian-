@@ -1,0 +1,106 @@
+name: Custom Windows 11 QEMU (Tailscale & noVNC)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win11-iso:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM, OVMF & Storage (128GB)
+        run: |
+          echo "=== [STEP 1/4] Installing QEMU, KVM & UEFI Firmware ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            ovmf \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Virtual Disk (128GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 128G
+
+      - name: 2. Download Windows 11 ISO Image
+        run: |
+          echo "=== [STEP 2/4] Downloading Windows 11 Insider Preview ISO ==="
+          
+          ISO_URL="https://archive.org/download/windows-11-insider-preview-client-x-64-it-it-22621_202601/Windows11_InsiderPreview_Client_x64_it-it_22621.iso"
+          
+          echo "Downloading from: $ISO_URL"
+          aria2c -x 16 -s 16 -k 1M -o /tmp/win11.iso "$ISO_URL" || wget -O /tmp/win11.iso "$ISO_URL"
+          
+          ls -lh /tmp/win11.iso
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="win11-qemu-runner-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Launch QEMU Windows 11 & noVNC Web Access
+        run: |
+          echo "=== [STEP 4/4] Starting QEMU Windows 11 Machine ==="
+          
+          # Запуск QEMU с эмуляцией UEFI (OVMF)
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -m 8192 \
+            -smp 4 \
+            -cpu host \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win11.iso,index=1,media=cdrom \
+            -boot d \
+            -vnc 127.0.0.1:0 \
+            -net nic,model=e1000 \
+            -net user \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          # Запуск noVNC моста
+          NOVNC_DIR=$(dpkg -L novnc 2>/dev/null | grep -E 'vnc.html|index.html' | head -n 1 | xargs dirname)
+          if [ -z "$NOVNC_DIR" ]; then NOVNC_DIR="/usr/share/novnc"; fi
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 11 QEMU RUNNER READY"
+          echo "=================================================="
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo " Storage Size : 128 GB (qcow2)"
+          echo " RAM          : 8 GB"
+          echo " CPU Cores    : 4 Cores"
+          echo "=================================================="
+
+          # Удерживаем раннер
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Win11 Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
