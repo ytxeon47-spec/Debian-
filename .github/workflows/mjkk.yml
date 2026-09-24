@@ -1,0 +1,98 @@
+name: Debian Desktop Direct VNC (Tailscale & noVNC)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-debian-desktop:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install Debian Desktop, XFCE4 & VNC
+        run: |
+          echo "=== [STEP 1/4] Installing Debian Desktop & VNC Stack ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 \
+            xfce4-goodies \
+            x11vnc \
+            xvfb \
+            mesa-utils \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            novnc \
+            websockify \
+            curl \
+            wget
+
+          echo "=== Enabling GPU / DRI permissions ==="
+          if [ -d /dev/dri ]; then
+            sudo chmod -R 666 /dev/dri
+          fi
+
+      - name: 2. Connect Tailscale (Auto Connect)
+        run: |
+          echo "=== [STEP 2/4] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          # Автоматическое подключение без подтверждений
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="debian-desktop-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 3. Configure VNC & Set Password
+        run: |
+          echo "=== [STEP 3/4] Setting Up VNC Password ==="
+          mkdir -p ~/.vnc
+          
+          # Устанавливаем пароль VNC: rootroot
+          x11vnc -storepw rootroot ~/.vnc/passwd
+
+      - name: 4. Launch Desktop & noVNC Web Server
+        run: |
+          echo "=== [STEP 4/4] Starting GUI & Web Server ==="
+          # Запуск виртуального экрана 1280x720
+          Xvfb :1 -screen 0 1280x720x24 &
+          sleep 2
+          
+          # Запуск графического окружения XFCE4
+          DISPLAY=:1 startxfce4 &
+          sleep 2
+          
+          # Запуск VNC сервера (порт 5900)
+          x11vnc -rfbauth ~/.vnc/passwd -shared -forever -rfbport 5900 -display :1 &
+          sleep 2
+
+          # Запуск noVNC моста для браузера (порт 8006)
+          NOVNC_DIR=$(dpkg -L novnc 2>/dev/null | grep -E 'vnc.html|index.html' | head -n 1 | xargs dirname)
+          if [ -z "$NOVNC_DIR" ]; then NOVNC_DIR="/usr/share/novnc"; fi
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " DEBIAN DESKTOP READY"
+          echo "=================================================="
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo " Raw VNC Port : $TAILSCALE_IP:5900"
+          echo " Password     : rootroot"
+          echo "=================================================="
+
+          # Удержание работы ранера (6 часов)
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "Runner Online | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
