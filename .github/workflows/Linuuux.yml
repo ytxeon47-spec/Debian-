@@ -1,0 +1,131 @@
+name: Debian Desktop 3D Ready (128GB Storage)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-debian-desktop:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install Debian Desktop, XFCE4 & TigerVNC
+        run: |
+          echo "=== [STEP 1/5] Installing GUI, Drivers & TigerVNC ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xfce4 \
+            xfce4-goodies \
+            tigervnc-standalone-server \
+            tigervnc-common \
+            mesa-utils \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
+            libosmesa6 \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            e2fsprogs
+
+          echo "=== Enabling GPU / DRI Permissions ==="
+          if [ -d /dev/dri ]; then
+            sudo chmod -R 666 /dev/dri
+          fi
+
+      - name: 2. Create & Mount 128GB Virtual Disk
+        run: |
+          echo "=== [STEP 2/5] Allocating 128GB Virtual Drive ==="
+          
+          # Создаем разреженный образ диска на 128 ГБ
+          sudo truncate -s 128G /disk128gb.img
+          
+          # Форматируем в ext4
+          sudo mkfs.ext4 -F /disk128gb.img
+          
+          # Создаем точку монтирования и монтируем диск
+          sudo mkdir -p /mnt/disk128g
+          sudo mount -o loop /disk128gb.img /mnt/disk128g
+          sudo chmod 777 /mnt/disk128g
+          
+          echo "=== Disk Allocation Success ==="
+          df -h /mnt/disk128g
+
+      - name: 3. Connect Tailscale
+        run: |
+          echo "=== [STEP 3/5] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="debian-runner-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 4. Setup Passwords & Credentials for ROOT
+        run: |
+          echo "=== [STEP 4/5] Setting Passwords (root / rootroot) ==="
+          
+          # Задаем системный пароль для root
+          echo "root:rootroot" | sudo chpasswd
+          
+          # Настраиваем VNC пароль для root
+          sudo mkdir -p /root/.vnc
+          echo "rootroot" | sudo vncpasswd -f > /tmp/vncpass
+          sudo mv /tmp/vncpass /root/.vnc/passwd
+          sudo chmod 600 /root/.vnc/passwd
+          
+          # Создаем xstartup файл для запуска графики XFCE4
+          echo "#!/bin/sh" | sudo tee /root/.vnc/xstartup > /dev/null
+          echo "unset SESSION_MANAGER" | sudo tee -a /root/.vnc/xstartup > /dev/null
+          echo "unset DBUS_SESSION_BUS_ADDRESS" | sudo tee -a /root/.vnc/xstartup > /dev/null
+          echo "export GALLIUM_DRIVER=llvmpipe" | sudo tee -a /root/.vnc/xstartup > /dev/null
+          echo "export MESA_GL_VERSION_OVERRIDE=3.3" | sudo tee -a /root/.vnc/xstartup > /dev/null
+          echo "exec startxfce4" | sudo tee -a /root/.vnc/xstartup > /dev/null
+          sudo chmod +x /root/.vnc/xstartup
+
+      - name: 5. Launch TigerVNC with 3D & noVNC
+        run: |
+          echo "=== [STEP 5/5] Starting VNC Server & Web Bridge ==="
+          
+          # 1. Запуск TigerVNC сервера от имени root (порт 5900)
+          sudo vncserver :1 -geometry 1280x720 -depth 24 -rfbport 5900
+          sleep 3
+
+          # 2. Запуск noVNC моста для доступа из браузера на порту 8006
+          NOVNC_DIR=$(dpkg -L novnc 2>/dev/null | grep -E 'vnc.html|index.html' | head -n 1 | xargs dirname)
+          if [ -z "$NOVNC_DIR" ]; then NOVNC_DIR="/usr/share/novnc"; fi
+          sudo websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " DEBIAN DESKTOP IS READY"
+          echo "=================================================="
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo " Raw VNC Port : $TAILSCALE_IP:5900"
+          echo "--------------------------------------------------"
+          echo " CREDENTIALS:"
+          echo " User         : root"
+          echo " Password     : rootroot"
+          echo " VNC Password : rootroot"
+          echo " Storage 128G : /mnt/disk128g"
+          echo " RAM          : ~12 GB"
+          echo " CPU Cores    : 4 Cores"
+          echo "=================================================="
+
+          # Удерживаем раннер 6 часов
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "Runner Active | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
