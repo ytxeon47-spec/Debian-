@@ -51,8 +51,8 @@ jobs:
             -e USERNAME="$USERNAME" \
             -e PASSWORD="$PASSWORD" \
             -e AUTOLOGIN="N" \
-            -e CPU_CORES="12" \
-            -e RAM_SIZE="32G" \
+            -e CPU_CORES="4" \
+            -e RAM_SIZE="14G" \
             -e DISK_SIZE="512G" \
             -p 8006:8006 \
             -p 3389:3389 \
