@@ -1,0 +1,131 @@
+name: Windows 10 LTSC QEMU (Tailscale & noVNC)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-win10-iso:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Install QEMU, KVM, OVMF & Storage (128GB)
+        run: |
+          echo "=== [STEP 1/5] Installing QEMU, KVM & UEFI Firmware ==="
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            ovmf \
+            novnc \
+            websockify \
+            curl \
+            wget \
+            aria2 \
+            zenity
+
+          echo "=== Enabling KVM Permissions ==="
+          sudo chmod 666 /dev/kvm || true
+
+          echo "=== Creating Virtual Disk (128GB qcow2) ==="
+          qemu-img create -f qcow2 /tmp/main_disk.qcow2 128G
+
+      - name: 2. Setup User & Autostart Popup
+        env:
+          USERNAME: ${{ secrets.USERNAME }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          echo "=== [STEP 2/5] Setting up user and welcome popup ==="
+          if [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+            if ! id -u "$USERNAME" >/dev/null 2>&1; then
+                sudo useradd -m -s /bin/bash "$USERNAME"
+                echo "$USERNAME:$PASSWORD" | sudo chpasswd
+                sudo usermod -aG sudo "$USERNAME"
+            fi
+
+            USER_HOME="/home/$USERNAME"
+            sudo mkdir -p "$USER_HOME/.config/autostart"
+
+            # Пишем файл в одну строку с \n, чтобы YAML-парсер не увидел квадратные скобки на новой строке
+            printf "[Desktop Entry]\nType=Application\nName=MX DEV Welcome\nExec=bash -c 'sleep 3 && zenity --info --title=\"Welcome from MX DEV\" --text=\"Welcome! This system is ready.\"' \nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\n" | sudo tee "$USER_HOME/.config/autostart/mxdev-welcome.desktop" > /dev/null
+
+            sudo chown -R "$USERNAME:$USERNAME" "$USER_HOME/.config"
+          else
+            echo "Skipping user creation: USERNAME or PASSWORD secrets are not set."
+          fi
+
+      - name: 3. Download Windows 10 LTSC ISO Image
+        run: |
+          echo "=== [STEP 3/5] Downloading Windows 10 Enterprise LTSC ISO ==="
+          
+          ISO_URL="https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_202301/en-us_windows_10_enterprise_ltsc_2021_x64.iso"
+          
+          echo "Downloading to /tmp/win10.iso..."
+          aria2c -x 16 -s 16 -k 1M -d /tmp -o win10.iso "$ISO_URL" || wget -O /tmp/win10.iso "$ISO_URL"
+          
+          ls -lh /tmp/win10.iso
+
+      - name: 4. Connect Tailscale
+        run: |
+          echo "=== [STEP 4/5] Connecting Tailscale ==="
+          curl -fsSL https://tailscale.com/install.sh | sh
+          
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" \
+            --hostname="win10-qemu-runner-${{ github.run_id }}" \
+            --accept-routes || true
+          
+          TS_IP=""
+          RETRIES=0
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt 10 ]; do
+              TS_IP=$(tailscale ip -4 || true)
+              sleep 3
+              RETRIES=$((RETRIES+1))
+          done
+          
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+
+      - name: 5. Launch QEMU Windows 10 & noVNC Web Access
+        run: |
+          echo "=== [STEP 5/5] Starting QEMU Windows 10 Machine ==="
+          
+          # Launch QEMU with UEFI emulation (OVMF)
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -m 8192 \
+            -smp 4 \
+            -cpu host \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -drive file=/tmp/main_disk.qcow2,format=qcow2,index=0,media=disk \
+            -drive file=/tmp/win10.iso,index=1,media=cdrom \
+            -boot d \
+            -vnc 127.0.0.1:0 \
+            -net nic,model=e1000 \
+            -net user \
+            -usb -device usb-tablet \
+            -daemonize
+
+          sleep 5
+
+          # Launch noVNC bridge
+          NOVNC_DIR=$(dpkg -L novnc 2>/dev/null | grep -E 'vnc.html|index.html' | head -n 1 | xargs dirname)
+          if [ -z "$NOVNC_DIR" ]; then NOVNC_DIR="/usr/share/novnc"; fi
+          websockify --web "$NOVNC_DIR" 8006 127.0.0.1:5900 &
+          sleep 2
+
+          echo "=================================================="
+          echo " WINDOWS 10 LTSC QEMU RUNNER READY"
+          echo "=================================================="
+          echo " Tailscale IP : $TAILSCALE_IP"
+          echo " Web VNC URL  : http://$TAILSCALE_IP:8006/vnc.html"
+          echo " Storage Size : 128 GB (qcow2)"
+          echo " RAM          : 8 GB"
+          echo " CPU Cores    : 4 Cores"
+          echo "=================================================="
+
+          # Keep runner alive for 6 hours
+          END_TIME=$(( $(date +%s) + 21600 ))
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 300
+            echo "QEMU Win10 Running | Tailscale IP: $TAILSCALE_IP | $(date)"
+          done
